@@ -1,6 +1,6 @@
 /// System simulator that models request processing, queuing, and replica behavior
 
-use crate::types::{PendingReplica, SimulatorState, SystemState, TargetState};
+use crate::sim::types::{PendingReplica, SimulatorState, SystemState, TargetState};
 
 /// Configuration for the simulator (immutable)
 #[derive(Debug, Clone)]

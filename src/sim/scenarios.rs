@@ -1,10 +1,10 @@
 /// Example simulation scenarios with different workload patterns
 
-use crate::controller::Controller;
-use crate::metrics::Metrics;
-use crate::simulator::{step, SimulatorConfig};
-use crate::types::{SimulatorState, TargetState};
-use crate::workload::WorkloadPattern;
+use crate::sim::controller::Controller;
+use crate::sim::metrics::Metrics;
+use crate::sim::simulator::{step, SimulatorConfig};
+use crate::sim::types::{SimulatorState, TargetState};
+use crate::shared::workload::WorkloadPattern;
 use std::fs::{self, File};
 use std::io::Write;
 

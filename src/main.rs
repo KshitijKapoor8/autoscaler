@@ -1,12 +1,11 @@
-mod types;
-mod workload;
-mod simulator;
-mod metrics;
-mod controller;
-mod scenarios;
+mod shared;
+mod sim;
+mod http;
 
 use clap::{Parser, Subcommand};
-use scenarios::*;
+use sim::scenarios::*;
+use http::service::run_service;
+use http::loadgen::{steady as loadgen_steady, step as loadgen_step, burst as loadgen_burst};
 
 #[derive(Parser)]
 #[command(name = "autoscaler")]
@@ -32,8 +31,68 @@ enum Commands {
         #[arg(value_name = "NAME")]
         name: String,
     },
-    /// Run all scenarios
+    /// Run all simulation scenarios
     All,
+    /// Run the real HTTP toy service
+    Service {
+        /// Port to listen on (default 8080)
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// CPU factor per request (1.0 = baseline)
+        #[arg(long, default_value_t = 1.0)]
+        cpu_factor: f64,
+        /// Memory factor per request (1.0 = baseline)
+        #[arg(long, default_value_t = 1.0)]
+        mem_factor: f64,
+    },
+    /// Run HTTP controller against local workers
+    HttpControl {
+        /// Base port for worker instances (e.g. 9000 → 9000,9001,...)
+        #[arg(long, default_value_t = 9000)]
+        base_port: u16,
+        /// Initial number of worker instances
+        #[arg(long, default_value_t = 1)]
+        initial_replicas: u32,
+        /// Duration in seconds to run the controller
+        #[arg(long, default_value_t = 120)]
+        duration: u32,
+        /// Control interval in seconds
+        #[arg(long, default_value_t = 10)]
+        control_interval: u32,
+    },
+    /// Run HTTP load generator against the toy service
+    Loadgen {
+        /// Base URL(s) of the service, comma-separated (e.g. http://127.0.0.1:8080,http://127.0.0.1:8081)
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        base_url: String,
+        /// Endpoint: cpu-heavy | mem-heavy | mixed
+        #[arg(long, default_value = "cpu-heavy")]
+        endpoint: String,
+        /// Pattern: steady | step | burst
+        #[arg(long, default_value = "steady")]
+        pattern: String,
+        /// Duration in seconds
+        #[arg(long, default_value_t = 60)]
+        duration: u32,
+        /// Base RPS (steady) or initial RPS (step/burst)
+        #[arg(long, default_value_t = 100.0)]
+        base_rps: f64,
+        /// Step-to RPS (for step)
+        #[arg(long, default_value_t = 500.0)]
+        step_to: f64,
+        /// Step time in seconds (for step)
+        #[arg(long, default_value_t = 30)]
+        step_at: u32,
+        /// Peak RPS (for burst)
+        #[arg(long, default_value_t = 800.0)]
+        peak_rps: f64,
+        /// Burst start time (for burst)
+        #[arg(long, default_value_t = 10)]
+        burst_start: u32,
+        /// Burst end time (for burst)
+        #[arg(long, default_value_t = 40)]
+        burst_end: u32,
+    },
 }
 
 fn main() {
@@ -66,6 +125,50 @@ fn main() {
             scenario_gradual_growth(&output);
             scenario_workday(&output);
             scenario_flash_sale(&output);
+        }
+        Some(Commands::Service { port, cpu_factor, mem_factor }) => {
+            if let Err(e) = run_service(*port, *cpu_factor, *mem_factor) {
+                eprintln!("Service error: {:#}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::HttpControl {
+            base_port,
+            initial_replicas,
+            duration,
+            control_interval,
+        }) => {
+            if let Err(e) = http::controller::run_http_controller(*base_port, *initial_replicas, *duration, *control_interval) {
+                eprintln!("HttpControl error: {:#}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Loadgen {
+            base_url,
+            endpoint,
+            pattern,
+            duration,
+            base_rps,
+            step_to,
+            step_at,
+            peak_rps,
+            burst_start,
+            burst_end,
+        }) => {
+            let res = match pattern.as_str() {
+                "steady" => loadgen_steady(base_url, endpoint, *base_rps, *duration),
+                "step" => loadgen_step(base_url, endpoint, *base_rps, *step_to, *step_at, *duration),
+                "burst" => loadgen_burst(base_url, endpoint, *base_rps, *peak_rps, *burst_start, *burst_end, *duration),
+                _ => {
+                    eprintln!("Unknown pattern: {} (expected steady|step|burst)", pattern);
+                    std::process::exit(1);
+                }
+            };
+
+            if let Err(e) = res {
+                eprintln!("Loadgen error: {:#}", e);
+                std::process::exit(1);
+            }
         }
         None => {
             // Default: run step scenario

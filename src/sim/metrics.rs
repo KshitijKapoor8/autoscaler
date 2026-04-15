@@ -1,6 +1,6 @@
 /// Derives metrics from system state
 
-use crate::types::SystemState;
+use crate::sim::types::SystemState;
 
 pub struct Metrics {
     pub avg_latency_ms: f64,

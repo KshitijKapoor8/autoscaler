@@ -1,7 +1,7 @@
 /// Unified autoscaler controller that makes both horizontal and vertical scaling decisions
 
-use crate::metrics::Metrics;
-use crate::types::{Bottleneck, SystemState, TargetState};
+use crate::sim::metrics::Metrics;
+use crate::sim::types::{Bottleneck, SystemState, TargetState};
 
 pub struct Controller {
     pub latency_target_ms: f64,
