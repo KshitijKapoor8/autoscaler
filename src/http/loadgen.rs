@@ -1,19 +1,25 @@
 use crate::shared::workload::WorkloadPattern;
 use anyhow::Result;
 use reqwest::blocking::Client;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-/// Simple local HTTP load generator using the existing WorkloadPattern
+/// Simple local HTTP load generator using the existing WorkloadPattern.
+///
+/// Requests are fired concurrently — each request is spawned on its own thread
+/// so that the achieved RPS is not limited by per-request latency.
 pub fn run_loadgen(
     base_url: &str,
     endpoint: &str,
     pattern: WorkloadPattern,
     duration_s: u32,
 ) -> Result<()> {
-    let client = Client::builder()
+    let client = Arc::new(Client::builder()
         .danger_accept_invalid_certs(true)
-        .build()?;
+        .timeout(Duration::from_secs(30))
+        .build()?);
 
     let endpoints: Vec<String> = base_url
         .split(',')
@@ -28,45 +34,51 @@ pub fn run_loadgen(
 
     println!("Running loadgen against {:?} for {}s", endpoints, duration_s);
 
-    let mut total_sent = 0u64;
-    let mut total_errors = 0u64;
+    let total_sent   = Arc::new(AtomicU64::new(0));
+    let total_errors = Arc::new(AtomicU64::new(0));
     let mut rr_index: usize = 0;
 
     for t in 0..duration_s {
         let rps = pattern.rps_at(t);
-        let requests_this_second = rps.round().max(0.0) as u32;
+        let n = rps.round().max(0.0) as u32;
         let start = Instant::now();
 
-        for _ in 0..requests_this_second {
-            let client = &client;
-            let url = &endpoints[rr_index % endpoints.len()];
-            rr_index = rr_index.wrapping_add(1);
-            total_sent += 1;
-            // Fire-and-forget style; errors are logged but do not stop the run
-            if let Err(e) = client.get(url).send() {
-                total_errors += 1;
-                eprintln!("[loadgen] request error: {}", e);
-            }
+        // Spawn n concurrent requests — don't block within the second window
+        for _ in 0..n {
+            let client   = client.clone();
+            let url      = endpoints[rr_index % endpoints.len()].clone();
+            rr_index     = rr_index.wrapping_add(1);
+            let sent_ctr = total_sent.clone();
+            let err_ctr  = total_errors.clone();
+            std::thread::spawn(move || {
+                sent_ctr.fetch_add(1, Ordering::Relaxed);
+                if client.get(&url).send().is_err() {
+                    err_ctr.fetch_add(1, Ordering::Relaxed);
+                }
+            });
         }
 
-        // Sleep until the end of the second to approximate the target RPS
+        // Sleep the remainder of the second so we hit ~n RPS
         let elapsed = start.elapsed();
         if elapsed < Duration::from_secs(1) {
             sleep(Duration::from_secs(1) - elapsed);
         }
 
         if t % 10 == 0 {
-            println!("[loadgen] t={}s, rps_target={:.0}, sent={} (total_sent={}, errors={})",
-                t,
-                rps,
-                requests_this_second,
-                total_sent,
-                total_errors,
+            println!(
+                "[loadgen] t={}s  rps_target={:.0}  sent_this_sec={}  (total={} errors={})",
+                t, rps, n,
+                total_sent.load(Ordering::Relaxed),
+                total_errors.load(Ordering::Relaxed),
             );
         }
     }
 
-    println!("[loadgen] complete: total_sent={}, errors={}", total_sent, total_errors);
+    println!(
+        "[loadgen] complete: total_sent={}, errors={}",
+        total_sent.load(Ordering::Relaxed),
+        total_errors.load(Ordering::Relaxed),
+    );
     Ok(())
 }
 

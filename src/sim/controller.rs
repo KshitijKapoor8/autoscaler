@@ -18,7 +18,7 @@ pub struct Controller {
 impl Controller {
     pub fn new() -> Self {
         Self {
-            latency_target_ms: 50.0,
+            latency_target_ms: 400.0,  // scale up when p50 latency exceeds 400ms
             cpu_util_target: 70.0,
             mem_util_target: 70.0,
             min_replicas: 1,
@@ -40,7 +40,7 @@ impl Controller {
         let high_latency = metrics.avg_latency_ms > self.latency_target_ms;
         let high_cpu = state.cpu_util > self.cpu_util_target;
         let high_mem = state.mem_util > self.mem_util_target;
-        let has_queue = state.waiting_requests > 100;
+        let has_queue = state.waiting_requests > 0;
 
         // Check for overprovisioning (require VERY low utilization to avoid thrashing)
         let very_low_cpu = state.cpu_util < self.cpu_util_target * 0.3;

@@ -38,18 +38,24 @@ enum Commands {
         /// Port to listen on (default 8080)
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        /// CPU factor per request (1.0 = baseline)
+        /// CPU factor per request — controls how much CPU work each request does (1.0 = baseline)
         #[arg(long, default_value_t = 1.0)]
         cpu_factor: f64,
-        /// Memory factor per request (1.0 = baseline)
+        /// Memory factor per request — controls allocation size per request (1.0 = baseline)
         #[arg(long, default_value_t = 1.0)]
         mem_factor: f64,
+        /// Max requests processed concurrently — the vertical scaling knob
+        #[arg(long, default_value_t = 4)]
+        max_concurrency: usize,
     },
-    /// Run HTTP controller against local workers
+    /// Run HTTP controller + proxy against local workers
     HttpControl {
-        /// Base port for worker instances (e.g. 9000 → 9000,9001,...)
+        /// Base port for worker instances (e.g. 9000 → 9000, 9001, …)
         #[arg(long, default_value_t = 9000)]
         base_port: u16,
+        /// Stable proxy port — point your load generator here
+        #[arg(long, default_value_t = 8080)]
+        proxy_port: u16,
         /// Initial number of worker instances
         #[arg(long, default_value_t = 1)]
         initial_replicas: u32,
@@ -59,6 +65,12 @@ enum Commands {
         /// Control interval in seconds
         #[arg(long, default_value_t = 10)]
         control_interval: u32,
+        /// CPU factor per request for workers (sets workload type, fixed for the run)
+        #[arg(long, default_value_t = 1.0)]
+        cpu_factor: f64,
+        /// Memory factor per request for workers (sets workload type, fixed for the run)
+        #[arg(long, default_value_t = 1.0)]
+        mem_factor: f64,
     },
     /// Run HTTP load generator against the toy service
     Loadgen {
@@ -126,19 +138,25 @@ fn main() {
             scenario_workday(&output);
             scenario_flash_sale(&output);
         }
-        Some(Commands::Service { port, cpu_factor, mem_factor }) => {
-            if let Err(e) = run_service(*port, *cpu_factor, *mem_factor) {
+        Some(Commands::Service { port, cpu_factor, mem_factor, max_concurrency }) => {
+            if let Err(e) = run_service(*port, *cpu_factor, *mem_factor, *max_concurrency) {
                 eprintln!("Service error: {:#}", e);
                 std::process::exit(1);
             }
         }
         Some(Commands::HttpControl {
             base_port,
+            proxy_port,
             initial_replicas,
             duration,
             control_interval,
+            cpu_factor,
+            mem_factor,
         }) => {
-            if let Err(e) = http::controller::run_http_controller(*base_port, *initial_replicas, *duration, *control_interval) {
+            if let Err(e) = http::controller::run_http_controller(
+                *base_port, *proxy_port, *initial_replicas, *duration, *control_interval,
+                *cpu_factor, *mem_factor,
+            ) {
                 eprintln!("HttpControl error: {:#}", e);
                 std::process::exit(1);
             }
