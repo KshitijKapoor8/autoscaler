@@ -1,4 +1,4 @@
-use crate::http::proxy::SharedBackends;
+use crate::http::proxy::{BackendEntry, SharedBackends};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -178,18 +178,22 @@ impl Executor {
 
     /// Ensure exactly `target` workers are running (horizontal scale up/down).
     pub fn ensure_workers(&mut self, target: usize) -> Result<()> {
+        // worker_threads = how many CPU threads each worker process gets.
+        // Capped at max_concurrency so we never have more CPU threads than semaphore slots.
+        let worker_threads = (self.cpu_per_replica.ceil() as usize).max(1).min(self.max_concurrency);
         while self.workers.len() < target {
             let port = self.base_port + self.workers.len() as u16;
             let worker = spawn_worker(
                 port, self.cpu_factor, self.mem_factor,
                 self.max_concurrency, self.cpu_per_replica,
+                worker_threads,
                 self.cgroup.as_ref(),
             )?;
             if self.cgroup.is_some() {
-                println!("[executor] started worker :{} (cpu_quota={:.2} CPUs, max_concurrency={})",
-                    port, self.cpu_per_replica, self.max_concurrency);
+                println!("[executor] started worker :{} (cpu_quota={:.2} CPUs, max_concurrency={}, worker_threads={})",
+                    port, self.cpu_per_replica, self.max_concurrency, worker_threads);
             } else {
-                println!("[executor] started worker :{} (max_concurrency={})", port, self.max_concurrency);
+                println!("[executor] started worker :{} (max_concurrency={}, worker_threads={})", port, self.max_concurrency, worker_threads);
             }
             self.workers.push(worker);
             self.sync_backends();
@@ -211,7 +215,27 @@ impl Executor {
     }
 
     fn sync_backends(&self) {
-        *self.backends.lock().unwrap() = self.worker_urls();
+        let mut locked = self.backends.lock().unwrap();
+        let new_urls: Vec<String> = self.workers
+            .iter()
+            .map(|w| format!("http://127.0.0.1:{}", w.port))
+            .collect();
+
+        // Remove entries for workers that no longer exist.
+        locked.retain(|e| new_urls.contains(&e.url));
+
+        // Add entries for newly started workers (in_flight starts at 0).
+        for url in &new_urls {
+            if !locked.iter().any(|e| &e.url == url) {
+                locked.push(BackendEntry {
+                    url: url.clone(),
+                    in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                });
+            }
+        }
+
+        // Keep the list in the same order as self.workers.
+        locked.sort_by_key(|e| new_urls.iter().position(|u| u == &e.url).unwrap_or(usize::MAX));
     }
 }
 
@@ -240,6 +264,7 @@ fn spawn_worker(
     mem_factor: f64,
     max_concurrency: usize,
     cpu_per_replica: f64,
+    worker_threads: usize,
     cgroup: Option<&CgroupManager>,
 ) -> Result<Worker> {
     // Create and configure the sub-cgroup before spawning so the quota is
@@ -255,6 +280,7 @@ fn spawn_worker(
         .arg("--cpu-factor").arg(format!("{:.3}", cpu_factor))
         .arg("--mem-factor").arg(format!("{:.3}", mem_factor))
         .arg("--max-concurrency").arg(max_concurrency.to_string())
+        .arg("--worker-threads").arg(worker_threads.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

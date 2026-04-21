@@ -96,13 +96,8 @@ pub fn step(
     duration_s: u32,
 ) -> Result<()> {
     run_loadgen(
-        base_url,
-        endpoint,
-        WorkloadPattern::Step {
-            base,
-            step_to,
-            step_at,
-        },
+        base_url, endpoint,
+        WorkloadPattern::Step { base, step_to, step_at },
         duration_s,
     )
 }
@@ -117,13 +112,74 @@ pub fn burst(
     duration_s: u32,
 ) -> Result<()> {
     run_loadgen(
-        base_url,
-        endpoint,
-        WorkloadPattern::Burst {
-            base,
-            peak,
-            burst_start,
-            burst_end,
+        base_url, endpoint,
+        WorkloadPattern::Burst { base, peak, burst_start, burst_end },
+        duration_s,
+    )
+}
+
+pub fn ramp(
+    base_url: &str,
+    endpoint: &str,
+    base: f64,
+    peak: f64,
+    ramp_duration: u32,
+    duration_s: u32,
+) -> Result<()> {
+    run_loadgen(
+        base_url, endpoint,
+        WorkloadPattern::Ramp { base, peak, ramp_duration },
+        duration_s,
+    )
+}
+
+pub fn sawtooth(
+    base_url: &str,
+    endpoint: &str,
+    base: f64,
+    peak: f64,
+    period: u32,
+    duration_s: u32,
+) -> Result<()> {
+    run_loadgen(
+        base_url, endpoint,
+        WorkloadPattern::Sawtooth { base, peak, period },
+        duration_s,
+    )
+}
+
+pub fn wave(
+    base_url: &str,
+    endpoint: &str,
+    center: f64,
+    amplitude: f64,
+    period_s: u32,
+    duration_s: u32,
+) -> Result<()> {
+    run_loadgen(
+        base_url, endpoint,
+        WorkloadPattern::Wave { center, amplitude, period_s },
+        duration_s,
+    )
+}
+
+pub fn double_burst(
+    base_url: &str,
+    endpoint: &str,
+    base: f64,
+    peak: f64,
+    burst1_start: u32,
+    burst1_end: u32,
+    burst2_start: u32,
+    burst2_end: u32,
+    duration_s: u32,
+) -> Result<()> {
+    run_loadgen(
+        base_url, endpoint,
+        WorkloadPattern::DoubleBurst {
+            base, peak,
+            burst1_start, burst1_end,
+            burst2_start, burst2_end,
         },
         duration_s,
     )

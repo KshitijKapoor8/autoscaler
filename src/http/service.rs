@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::hint::black_box;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicU64, AtomicUsize, Ordering}};
@@ -10,6 +11,7 @@ pub struct ServiceConfig {
     pub cpu_factor: f64,
     pub mem_factor: f64,
     pub max_concurrency: usize,
+    pub worker_threads: usize,
 }
 
 /// Counting semaphore: limits how many requests are actively processed at once.
@@ -52,6 +54,41 @@ impl Drop for SemaphoreGuard {
     }
 }
 
+/// Fixed-size thread pool for CPU-bound work.
+///
+/// Requests submit a closure and block until it completes.  With N threads and
+/// more than N concurrent requests, callers queue inside the pool — giving real
+/// CPU backpressure without spawning unbounded OS threads.
+struct CpuThreadPool {
+    sender: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl CpuThreadPool {
+    fn new(num_threads: usize) -> Arc<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send + 'static>>();
+        let rx = Arc::new(Mutex::new(rx));
+        for _ in 0..num_threads.max(1) {
+            let rx = rx.clone();
+            thread::spawn(move || loop {
+                match rx.lock().unwrap().recv() {
+                    Ok(job) => job(),
+                    Err(_)  => break,
+                }
+            });
+        }
+        Arc::new(Self { sender: tx })
+    }
+
+    /// Submit a job and block the calling thread until it finishes.
+    fn run<F: FnOnce() + Send + 'static>(&self, f: F) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        self.sender
+            .send(Box::new(move || { f(); let _ = done_tx.send(()); }))
+            .expect("cpu threadpool workers have stopped");
+        done_rx.recv().expect("cpu threadpool job panicked");
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct ServiceMetrics {
     pub total_requests: Arc<AtomicU64>,
@@ -89,17 +126,18 @@ impl ServiceMetrics {
     }
 }
 
-pub fn run_service(port: u16, cpu_factor: f64, mem_factor: f64, max_concurrency: usize) -> anyhow::Result<()> {
+pub fn run_service(port: u16, cpu_factor: f64, mem_factor: f64, max_concurrency: usize, worker_threads: usize) -> anyhow::Result<()> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr)?;
     println!(
-        "[service:{}] listening (cpu_factor={:.2}, mem_factor={:.2}, max_concurrency={})",
-        port, cpu_factor, mem_factor, max_concurrency
+        "[service:{}] listening (cpu_factor={:.2}, mem_factor={:.2}, max_concurrency={}, worker_threads={})",
+        port, cpu_factor, mem_factor, max_concurrency, worker_threads
     );
 
     let metrics = ServiceMetrics::default();
-    let config = ServiceConfig { cpu_factor, mem_factor, max_concurrency };
+    let config = ServiceConfig { cpu_factor, mem_factor, max_concurrency, worker_threads };
     let semaphore = Semaphore::new(max_concurrency);
+    let pool = CpuThreadPool::new(worker_threads);
 
     // Periodic summary logging
     {
@@ -125,8 +163,9 @@ pub fn run_service(port: u16, cpu_factor: f64, mem_factor: f64, max_concurrency:
             Ok(stream) => {
                 let metrics = metrics.clone();
                 let semaphore = semaphore.clone();
+                let pool = pool.clone();
                 metrics.in_flight.fetch_add(1, Ordering::Relaxed);
-                thread::spawn(move || handle_client(stream, metrics, config, semaphore));
+                thread::spawn(move || handle_client(stream, metrics, config, semaphore, pool));
             }
             Err(e) => eprintln!("Failed to accept connection: {}", e),
         }
@@ -135,7 +174,7 @@ pub fn run_service(port: u16, cpu_factor: f64, mem_factor: f64, max_concurrency:
     Ok(())
 }
 
-fn handle_client(mut stream: TcpStream, metrics: ServiceMetrics, config: ServiceConfig, semaphore: Semaphore) {
+fn handle_client(mut stream: TcpStream, metrics: ServiceMetrics, config: ServiceConfig, semaphore: Semaphore, pool: Arc<CpuThreadPool>) {
     let start = Instant::now();
 
     let mut buf = [0u8; 1024];
@@ -188,18 +227,23 @@ fn handle_client(mut stream: TcpStream, metrics: ServiceMetrics, config: Service
 
     let success = if path.starts_with("/cpu-heavy") {
         metrics.cpu_requests.fetch_add(1, Ordering::Relaxed);
-        simulate_cpu_work((10_000_000.0 * config.cpu_factor).max(1.0) as u64);
+        let iters = (2_000_000.0 * config.cpu_factor).round() as u64;
+        pool.run(move || do_cpu_work(iters));
         write_response(&mut stream, 200, "OK", "cpu-heavy done");
         true
     } else if path.starts_with("/mem-heavy") {
         metrics.mem_requests.fetch_add(1, Ordering::Relaxed);
-        simulate_memory_work((10.0 * 1024.0 * 1024.0 * config.mem_factor).max(1024.0) as usize);
+        let bytes = (10 * 1024 * 1024) as f64 * config.mem_factor;
+        let _held = hold_memory(bytes as usize); // stays alive until end of this block
+        thread::sleep(Duration::from_millis(50));
         write_response(&mut stream, 200, "OK", "mem-heavy done");
         true
     } else if path.starts_with("/mixed") {
         metrics.mixed_requests.fetch_add(1, Ordering::Relaxed);
-        simulate_cpu_work((5_000_000.0 * config.cpu_factor).max(1.0) as u64);
-        simulate_memory_work((5.0 * 1024.0 * 1024.0 * config.mem_factor).max(1024.0) as usize);
+        let iters = (1_000_000.0 * config.cpu_factor).round() as u64;
+        let bytes = (5 * 1024 * 1024) as f64 * config.mem_factor;
+        let _held = hold_memory(bytes as usize);
+        pool.run(move || do_cpu_work(iters));
         write_response(&mut stream, 200, "OK", "mixed done");
         true
     } else {
@@ -217,7 +261,7 @@ fn serve_meta(path: &str, stream: &mut TcpStream, metrics: &ServiceMetrics, max_
         let total = metrics.total_requests.load(Ordering::Relaxed);
         let errors = metrics.total_errors.load(Ordering::Relaxed);
         let body = format!(
-            "requests_total={}\nin_flight={}\nerrors_total={}\navg_latency_ms={:.2}\nmax_concurrency={}\nactive_count={}\nqueue_depth={}\ncpu_requests={}\nmem_requests={}\nmixed_requests={}\n",
+            "requests_total={}\nin_flight={}\nerrors_total={}\navg_latency_ms={:.2}\nmax_concurrency={}\nactive_count={}\nqueue_depth={}\ncpu_requests={}\nmem_requests={}\nmixed_requests={}\nos_cpu_ticks={}\nrss_kb={}\n",
             total,
             metrics.in_flight.load(Ordering::Relaxed),
             errors,
@@ -228,6 +272,8 @@ fn serve_meta(path: &str, stream: &mut TcpStream, metrics: &ServiceMetrics, max_
             metrics.cpu_requests.load(Ordering::Relaxed),
             metrics.mem_requests.load(Ordering::Relaxed),
             metrics.mixed_requests.load(Ordering::Relaxed),
+            read_proc_cpu_ticks(),
+            read_proc_rss_kb(),
         );
         write_response(stream, 200, "OK", &body);
     } else {
@@ -256,25 +302,71 @@ fn write_response(stream: &mut TcpStream, status: u16, reason: &str, body: &str)
     let _ = stream.flush();
 }
 
-fn simulate_cpu_work(iters: u64) {
-    let mut x = 0u64;
-    for i in 0..iters {
-        x = x.wrapping_add(i.rotate_left(13) ^ 0xDEADBEEF);
-        if i % 1_000_000 == 0 {
-            std::hint::spin_loop();
-        }
+/// Read cumulative CPU ticks (utime + stime) for this process from /proc/self/stat.
+/// Returns 0 on any error or non-Linux platform.
+fn read_proc_cpu_ticks() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(data) = std::fs::read_to_string("/proc/self/stat") else { return 0 };
+        // /proc/self/stat: "pid (comm) state ppid ..."
+        // comm can contain spaces/parens, so find the LAST ')' to skip it.
+        let after_comm = match data.rfind(')') {
+            Some(i) => &data[i + 1..],
+            None => return 0,
+        };
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        // After ')': field 3 = index 0, field 14 (utime) = index 11, field 15 (stime) = index 12
+        let utime = fields.get(11).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        let stime = fields.get(12).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+        utime + stime
     }
-    std::sync::atomic::compiler_fence(Ordering::SeqCst);
-    let _ = x;
+    #[cfg(not(target_os = "linux"))]
+    { 0 }
 }
 
-fn simulate_memory_work(bytes: usize) {
-    let mut v = Vec::with_capacity(bytes);
-    v.resize(bytes, 0u8);
-    // Touch memory to ensure it's actually used
-    for i in (0..bytes).step_by(4096) {
-        v[i] = 1;
+/// Read resident set size in KB for this process from /proc/self/status.
+fn read_proc_rss_kb() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(data) = std::fs::read_to_string("/proc/self/status") else { return 0 };
+        for line in data.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                return rest.split_whitespace().next()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        0
     }
-    // Keep it alive briefly
-    thread::sleep(Duration::from_millis(10));
+    #[cfg(not(target_os = "linux"))]
+    { 0 }
+}
+
+/// Real CPU-bound work using non-trivial integer mixing that the compiler cannot eliminate.
+///
+/// Throughput is roughly 200–500M iterations/sec per thread depending on hardware.
+/// Default calibration at that rate:
+///   cpu_factor=1.0 → 2M iters → ~5–10ms  → 1 thread saturates at ~100–200 RPS
+///   cpu_factor=2.0 → 4M iters → ~10–20ms → 1 thread saturates at ~50–100 RPS
+///
+/// If the latency is too low or too high for your hardware, tune the constant (2_000_000).
+fn do_cpu_work(iters: u64) {
+    let mut state: u64 = 0x517c_c1b7_2722_0a95;
+    for i in 0..iters {
+        state ^= black_box(i).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        state  = black_box(state).rotate_left(31).wrapping_add(0x6c62_272e_07bb_0142);
+    }
+    black_box(state);
+}
+
+/// Allocate `bytes` of memory, touch every page to ensure it is resident in RAM,
+/// and return the Vec so the caller can hold it alive for the full request duration.
+/// Dropping the returned Vec releases the memory — simulating realistic RSS pressure
+/// under concurrent load.
+fn hold_memory(bytes: usize) -> Vec<u8> {
+    let mut v = vec![0u8; bytes];
+    for i in (0..bytes).step_by(4096) {
+        v[i] = black_box(1u8);
+    }
+    v
 }

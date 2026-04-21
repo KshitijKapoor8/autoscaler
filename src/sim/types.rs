@@ -1,30 +1,16 @@
-/// Global System State
-#[derive(Debug, Default, Clone)]
-pub struct SystemState {
-    /// Request metrics
-    pub time_s: u32,
-    pub waiting_requests: u32,
-    pub incoming_requests: u32,
-    pub incoming_rps: f64,
-    pub dropped_requests: u32,
+/// Simulator-internal state types.
+/// `SystemState`, `TargetState`, and `Bottleneck` live in `shared::types`; re-exported here
+/// so simulator.rs and scenarios.rs can continue importing from `sim::types`.
 
-    /// Scaling dimensions
-    pub num_replicas: u32,
-    pub cpu_per_replica: f64,
-    pub mem_per_replica: f64,
+pub use crate::shared::types::{SystemState, TargetState};
 
-    /// Current load metrics
-    pub cpu_util: f64,
-    pub mem_util: f64,
-}
-
-/// Used to simulate delay in worker start
+/// Used to simulate the delay between a scale-out decision and a worker becoming ready.
 #[derive(Debug, Clone)]
 pub struct PendingReplica {
     pub ready_at_s: u32,
 }
 
-/// Internal simulator state (separate from observable SystemState)
+/// Internal simulator state — separate from the observable `SystemState` the controller sees.
 #[derive(Debug, Clone)]
 pub struct SimulatorState {
     pub time: u32,
@@ -46,45 +32,4 @@ impl Default for SimulatorState {
             mem_per_replica: 2.0,
         }
     }
-}
-
-/// The goal system scaling that the controller must move toward
-#[derive(Debug, Clone)]
-pub struct TargetState {
-    pub num_replicas: u32,
-    pub cpu_per_replica: f64,
-    pub mem_per_replica: f64,
-}
-
-impl Default for TargetState {
-    fn default() -> Self {
-        Self {
-            num_replicas: 1,
-            cpu_per_replica: 1.0,
-            mem_per_replica: 2.0,
-        }
-    }
-}
-
-pub enum Bottleneck {
-    /// Total incoming demand too high for current replica count
-    ///
-    /// Implies horizontal scaling needed
-    Load,
-    /// Replicas are individually struggling
-    ///
-    /// Implies vertical scaling needed (increasing cpu_per_replica)
-    Cpu,
-    /// Replicas are individually running low on memory
-    ///
-    /// Implies vertical scaling needed (increasing mem_per_replica)
-    Memory,
-    /// Multiple bottlenecks present
-    Mixed,
-    /// Requests are being handled easily, the system has more resources than needed
-    Overprovisioned,
-    /// System is stable, not wasting resources and handling all requests
-    Stable,
-    /// Default state. Cannot determine current state.
-    Unknown,
 }

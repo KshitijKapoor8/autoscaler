@@ -5,7 +5,11 @@ mod http;
 use clap::{Parser, Subcommand};
 use sim::scenarios::*;
 use http::service::run_service;
-use http::loadgen::{steady as loadgen_steady, step as loadgen_step, burst as loadgen_burst};
+use http::loadgen::{
+    steady as loadgen_steady, step as loadgen_step, burst as loadgen_burst,
+    ramp as loadgen_ramp, sawtooth as loadgen_sawtooth, wave as loadgen_wave,
+    double_burst as loadgen_double_burst,
+};
 
 #[derive(Parser)]
 #[command(name = "autoscaler")]
@@ -45,8 +49,12 @@ enum Commands {
         #[arg(long, default_value_t = 1.0)]
         mem_factor: f64,
         /// Max requests processed concurrently — the vertical scaling knob
-        #[arg(long, default_value_t = 4)]
+        #[arg(long, default_value_t = 32)]
         max_concurrency: usize,
+        /// Number of threads in the CPU work pool — limits real CPU parallelism.
+        /// Set to ceil(cpu_per_replica); cgroup cpu.max enforces the hard OS limit on top.
+        #[arg(long, default_value_t = 2)]
+        worker_threads: usize,
     },
     /// Run HTTP controller + proxy against local workers
     HttpControl {
@@ -80,30 +88,45 @@ enum Commands {
         /// Endpoint: cpu-heavy | mem-heavy | mixed
         #[arg(long, default_value = "cpu-heavy")]
         endpoint: String,
-        /// Pattern: steady | step | burst
+        /// Pattern: steady | step | burst | ramp | sawtooth | wave | double-burst
         #[arg(long, default_value = "steady")]
         pattern: String,
         /// Duration in seconds
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 180)]
         duration: u32,
-        /// Base RPS (steady) or initial RPS (step/burst)
-        #[arg(long, default_value_t = 100.0)]
+        /// Base RPS — idle baseline for all patterns
+        #[arg(long, default_value_t = 5.0)]
         base_rps: f64,
-        /// Step-to RPS (for step)
-        #[arg(long, default_value_t = 500.0)]
+        /// Peak RPS — ceiling for burst/ramp/sawtooth/wave/double-burst
+        #[arg(long, default_value_t = 100.0)]
+        peak_rps: f64,
+        /// Step-to RPS (step only)
+        #[arg(long, default_value_t = 80.0)]
         step_to: f64,
-        /// Step time in seconds (for step)
+        /// Time in seconds at which step happens (step only)
         #[arg(long, default_value_t = 30)]
         step_at: u32,
-        /// Peak RPS (for burst)
-        #[arg(long, default_value_t = 800.0)]
-        peak_rps: f64,
-        /// Burst start time (for burst)
-        #[arg(long, default_value_t = 10)]
+        /// Burst/spike start time in seconds (burst, double-burst)
+        #[arg(long, default_value_t = 20)]
         burst_start: u32,
-        /// Burst end time (for burst)
-        #[arg(long, default_value_t = 40)]
+        /// Burst/spike end time in seconds (burst, double-burst)
+        #[arg(long, default_value_t = 60)]
         burst_end: u32,
+        /// Second burst start time (double-burst only)
+        #[arg(long, default_value_t = 100)]
+        burst2_start: u32,
+        /// Second burst end time (double-burst only)
+        #[arg(long, default_value_t = 140)]
+        burst2_end: u32,
+        /// How many seconds the ramp takes to reach peak (ramp only)
+        #[arg(long, default_value_t = 60)]
+        ramp_duration: u32,
+        /// Sawtooth/wave period in seconds
+        #[arg(long, default_value_t = 40)]
+        period: u32,
+        /// Wave centre RPS (wave only; use base_rps as centre, peak_rps sets amplitude)
+        #[arg(long, default_value_t = 40.0)]
+        wave_center: f64,
     },
 }
 
@@ -138,8 +161,8 @@ fn main() {
             scenario_workday(&output);
             scenario_flash_sale(&output);
         }
-        Some(Commands::Service { port, cpu_factor, mem_factor, max_concurrency }) => {
-            if let Err(e) = run_service(*port, *cpu_factor, *mem_factor, *max_concurrency) {
+        Some(Commands::Service { port, cpu_factor, mem_factor, max_concurrency, worker_threads }) => {
+            if let Err(e) = run_service(*port, *cpu_factor, *mem_factor, *max_concurrency, *worker_threads) {
                 eprintln!("Service error: {:#}", e);
                 std::process::exit(1);
             }
@@ -153,32 +176,39 @@ fn main() {
             cpu_factor,
             mem_factor,
         }) => {
+            let csv_dir = if cli.csv { Some(output.csv_dir.as_str()) } else { None };
             if let Err(e) = http::controller::run_http_controller(
                 *base_port, *proxy_port, *initial_replicas, *duration, *control_interval,
-                *cpu_factor, *mem_factor,
+                *cpu_factor, *mem_factor, csv_dir,
             ) {
                 eprintln!("HttpControl error: {:#}", e);
                 std::process::exit(1);
             }
         }
         Some(Commands::Loadgen {
-            base_url,
-            endpoint,
-            pattern,
-            duration,
-            base_rps,
-            step_to,
-            step_at,
-            peak_rps,
-            burst_start,
-            burst_end,
+            base_url, endpoint, pattern, duration,
+            base_rps, peak_rps,
+            step_to, step_at,
+            burst_start, burst_end,
+            burst2_start, burst2_end,
+            ramp_duration, period, wave_center,
         }) => {
             let res = match pattern.as_str() {
                 "steady" => loadgen_steady(base_url, endpoint, *base_rps, *duration),
-                "step" => loadgen_step(base_url, endpoint, *base_rps, *step_to, *step_at, *duration),
-                "burst" => loadgen_burst(base_url, endpoint, *base_rps, *peak_rps, *burst_start, *burst_end, *duration),
+                "step"   => loadgen_step(base_url, endpoint, *base_rps, *step_to, *step_at, *duration),
+                "burst"  => loadgen_burst(base_url, endpoint, *base_rps, *peak_rps, *burst_start, *burst_end, *duration),
+                "ramp"   => loadgen_ramp(base_url, endpoint, *base_rps, *peak_rps, *ramp_duration, *duration),
+                "sawtooth" => loadgen_sawtooth(base_url, endpoint, *base_rps, *peak_rps, *period, *duration),
+                "wave"   => loadgen_wave(base_url, endpoint, *wave_center, *peak_rps, *period, *duration),
+                "double-burst" => loadgen_double_burst(
+                    base_url, endpoint,
+                    *base_rps, *peak_rps,
+                    *burst_start, *burst_end,
+                    *burst2_start, *burst2_end,
+                    *duration,
+                ),
                 _ => {
-                    eprintln!("Unknown pattern: {} (expected steady|step|burst)", pattern);
+                    eprintln!("Unknown pattern: {} (expected steady|step|burst|ramp|sawtooth|wave|double-burst)", pattern);
                     std::process::exit(1);
                 }
             };
