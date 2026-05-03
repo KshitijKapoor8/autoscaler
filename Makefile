@@ -186,7 +186,57 @@ loadgen-double-burst:
 		--burst-start 20 --burst-end 60 \
 		--burst2-start 100 --burst2-end 140 --duration 180
 
-# ── simulation scenarios ────────────────────────────────────────────────────────
+# ── Docker-backed controller ─────────────────────────────────────────────────
+#
+# Workers run as Docker containers on the autoscaler-net bridge network.
+# Proxy still runs on the host at :8080.
+# Vertical scaling = `docker update --cpus` (in-place, no restart).
+# Horizontal scaling = `docker run` / `docker rm`.
+#
+# Prerequisites:
+#   1.  Docker is installed and your user can run `docker` without sudo
+#   2.  Run `make docker-build` once before starting containers
+
+.PHONY: docker-build
+docker-build:
+	docker build -t autoscaler:dev .
+
+.PHONY: docker-control
+docker-control:
+	$(ULIMIT) $(BIN) docker-control --proxy-port 8080 \
+		--initial-replicas 1 --duration 180 --control-interval 10
+
+.PHONY: docker-control-cpu
+docker-control-cpu:
+	$(ULIMIT) $(BIN) docker-control --proxy-port 8080 \
+		--cpu-factor 2.0 --mem-factor 1.0 \
+		--initial-replicas 1 --duration 180 --control-interval 10
+
+.PHONY: docker-control-mem
+docker-control-mem:
+	$(ULIMIT) $(BIN) docker-control --proxy-port 8080 \
+		--cpu-factor 1.0 --mem-factor 2.0 \
+		--initial-replicas 1 --duration 180 --control-interval 10
+
+.PHONY: docker-control-mixed
+docker-control-mixed:
+	$(ULIMIT) $(BIN) docker-control --proxy-port 8080 \
+		--cpu-factor 2.0 --mem-factor 2.0 \
+		--initial-replicas 1 --duration 180 --control-interval 10
+
+.PHONY: docker-control-cpu-csv
+docker-control-cpu-csv:
+	$(ULIMIT) $(BIN) docker-control --proxy-port 8080 \
+		--cpu-factor 2.0 --mem-factor 1.0 \
+		--initial-replicas 1 --duration 180 --control-interval 10 --csv
+
+# Remove all autoscaler worker containers and the bridge network.
+.PHONY: docker-clean
+docker-clean:
+	docker ps -a --filter "name=autoscaler-worker" -q | xargs -r docker rm -f
+	docker network rm autoscaler-net 2>/dev/null || true
+
+
 
 .PHONY: sim-steady sim-step sim-burst sim-growth sim-workday sim-flash-sale sim-all
 sim-steady:    ; $(BIN) scenario steady
@@ -235,6 +285,15 @@ help:
 	@echo "  make loadgen-mem      mem-heavy, steady"
 	@echo "  make loadgen-mixed    mixed, steady"
 	@echo "  Override: make loadgen-steady URL=http://127.0.0.1:9000"
+	@echo ""
+	@echo "Docker-backed controller  (requires: make docker-build first)"
+	@echo "  make docker-build            build autoscaler:dev image"
+	@echo "  make docker-control          baseline workload"
+	@echo "  make docker-control-cpu      cpu_factor=2.0"
+	@echo "  make docker-control-mem      mem_factor=2.0"
+	@echo "  make docker-control-mixed    cpu+mem heavy"
+	@echo "  make docker-control-cpu-csv  csv logging"
+	@echo "  make docker-clean            remove all worker containers + network"
 	@echo ""
 	@echo "Simulations"
 	@echo "  make sim-steady|sim-step|sim-burst|sim-growth|sim-workday|sim-flash-sale"

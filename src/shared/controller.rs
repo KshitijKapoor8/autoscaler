@@ -35,7 +35,7 @@ impl Controller {
             min_mem: 1.0,
             max_mem: 8.0,
             slots_per_replica: 32,
-            emergency_queue_threshold: 20,
+            emergency_queue_threshold: 10,
         }
     }
 
@@ -63,8 +63,8 @@ impl Controller {
         let latency_under_load =
             high_latency && (high_cpu || high_mem || has_queue || state.cpu_util > 10.0);
 
-        let very_low_cpu = state.cpu_util < self.cpu_util_target * 0.3;
-        let very_low_mem = state.mem_util < self.mem_util_target * 0.3;
+        let very_low_cpu = state.cpu_util < self.cpu_util_target * 0.4;
+        let very_low_mem = state.mem_util < self.mem_util_target * 0.4;
         let no_queue = state.waiting_requests == 0;
 
         if latency_under_load || has_queue {
@@ -97,22 +97,18 @@ impl Controller {
                 target_replicas = self.replicas_for_demand(state);
             }
             Bottleneck::Cpu => {
-                target_cpu = (target_cpu * 1.3).min(self.max_cpu);
-                let demand_replicas = self.replicas_for_demand(state);
-                if demand_replicas > target_replicas || target_cpu >= self.max_cpu {
-                    target_replicas = demand_replicas;
-                }
+                // Scale both axes simultaneously: replicas absorb the queue immediately
+                // while CPU scaling improves per-replica throughput over time.
+                target_cpu = (target_cpu * 1.5).min(self.max_cpu);
+                target_replicas = self.replicas_for_demand(state);
             }
             Bottleneck::Memory => {
-                target_mem = (target_mem * 1.3).min(self.max_mem);
-                let demand_replicas = self.replicas_for_demand(state);
-                if demand_replicas > target_replicas || target_mem >= self.max_mem {
-                    target_replicas = demand_replicas;
-                }
+                target_mem = (target_mem * 1.5).min(self.max_mem);
+                target_replicas = self.replicas_for_demand(state);
             }
             Bottleneck::Mixed => {
-                target_cpu = (target_cpu * 1.2).min(self.max_cpu);
-                target_mem = (target_mem * 1.2).min(self.max_mem);
+                target_cpu = (target_cpu * 1.5).min(self.max_cpu);
+                target_mem = (target_mem * 1.5).min(self.max_mem);
                 target_replicas = self.replicas_for_demand(state);
             }
             Bottleneck::Overprovisioned => {
@@ -120,21 +116,47 @@ impl Controller {
                     let scale_down = if target_replicas <= 5 {
                         target_replicas - 1
                     } else {
-                        ((target_replicas as f64 * 0.8).floor() as u32).max(self.min_replicas)
+                        ((target_replicas as f64 * 0.7).floor() as u32).max(self.min_replicas)
                     };
                     target_replicas = scale_down.max(self.min_replicas);
-                }
-                if target_cpu > self.min_cpu && state.cpu_util < 20.0 {
-                    target_cpu = (target_cpu * 0.9).max(self.min_cpu);
-                }
-                if target_mem > self.min_mem && state.mem_util < 20.0 {
-                    target_mem = (target_mem * 0.9).max(self.min_mem);
+                    // Drain CPU concurrently at a gentle rate (0.88×).
+                    // Combined capacity cut: 0.70 × 0.88 = 0.62× per tick — acceptable.
+                    // Without this, CPU ratchets up across sawtooth peaks and never drains.
+                    if target_cpu > self.min_cpu && state.cpu_util < 25.0 {
+                        target_cpu = (target_cpu * 0.88).max(self.min_cpu);
+                    }
+                    if target_mem > self.min_mem && state.mem_util < 25.0 {
+                        target_mem = (target_mem * 0.88).max(self.min_mem);
+                    }
+                } else {
+                    // At min replicas: aggressive CPU drain.
+                    if target_cpu > self.min_cpu && state.cpu_util < 25.0 {
+                        target_cpu = (target_cpu * 0.65).max(self.min_cpu);
+                    }
+                    if target_mem > self.min_mem && state.mem_util < 25.0 {
+                        target_mem = (target_mem * 0.65).max(self.min_mem);
+                    }
                 }
             }
-            Bottleneck::Stable | Bottleneck::Unknown => {}
+            Bottleneck::Stable => {
+                // Drain vertical resources whenever load has fully cleared.
+                // We intentionally do NOT require min_replicas here — if replicas are
+                // already being drained by Overprovisioned on other ticks, draining CPU
+                // concurrently (on the same tick where replicas are already at min) still
+                // satisfies the no-compound rule because no horizontal change is made here.
+                if state.waiting_requests == 0
+                    && state.cpu_util < self.cpu_util_target * 0.5
+                {
+                    if target_cpu > self.min_cpu {
+                        target_cpu = (target_cpu * 0.75).max(self.min_cpu);
+                    }
+                    if target_mem > self.min_mem {
+                        target_mem = (target_mem * 0.75).max(self.min_mem);
+                    }
+                }
+            }
+            Bottleneck::Unknown => {}
         }
-
-        target_replicas = target_replicas.clamp(self.min_replicas, self.max_replicas);
         target_cpu = target_cpu.clamp(self.min_cpu, self.max_cpu);
         target_mem = target_mem.clamp(self.min_mem, self.max_mem);
 

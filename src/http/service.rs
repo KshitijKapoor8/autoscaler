@@ -126,8 +126,8 @@ impl ServiceMetrics {
     }
 }
 
-pub fn run_service(port: u16, cpu_factor: f64, mem_factor: f64, max_concurrency: usize, worker_threads: usize) -> anyhow::Result<()> {
-    let addr = format!("127.0.0.1:{}", port);
+pub fn run_service(port: u16, bind_addr: &str, cpu_factor: f64, mem_factor: f64, max_concurrency: usize, worker_threads: usize) -> anyhow::Result<()> {
+    let addr = format!("{}:{}", bind_addr, port);
     let listener = TcpListener::bind(&addr)?;
     println!(
         "[service:{}] listening (cpu_factor={:.2}, mem_factor={:.2}, max_concurrency={}, worker_threads={})",

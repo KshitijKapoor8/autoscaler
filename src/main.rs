@@ -1,6 +1,7 @@
 mod shared;
 mod sim;
 mod http;
+mod docker;
 
 use clap::{Parser, Subcommand};
 use sim::scenarios::*;
@@ -42,6 +43,9 @@ enum Commands {
         /// Port to listen on (default 8080)
         #[arg(long, default_value_t = 8080)]
         port: u16,
+        /// Address to bind — use 127.0.0.1 (default) for local, 0.0.0.0 inside Docker
+        #[arg(long, default_value = "127.0.0.1")]
+        bind_addr: String,
         /// CPU factor per request — controls how much CPU work each request does (1.0 = baseline)
         #[arg(long, default_value_t = 1.0)]
         cpu_factor: f64,
@@ -79,6 +83,33 @@ enum Commands {
         /// Memory factor per request for workers (sets workload type, fixed for the run)
         #[arg(long, default_value_t = 1.0)]
         mem_factor: f64,
+    },
+    /// Run controller + proxy with Docker container workers
+    DockerControl {
+        /// Docker image to use for workers (build with: make docker-build)
+        #[arg(long, default_value = "autoscaler:dev")]
+        image: String,
+        /// Stable proxy port — point your load generator here
+        #[arg(long, default_value_t = 8080)]
+        proxy_port: u16,
+        /// Initial number of worker containers
+        #[arg(long, default_value_t = 1)]
+        initial_replicas: u32,
+        /// Duration in seconds to run the controller
+        #[arg(long, default_value_t = 180)]
+        duration: u32,
+        /// Control interval in seconds
+        #[arg(long, default_value_t = 10)]
+        control_interval: u32,
+        /// CPU factor per request (sets workload type, fixed for the run)
+        #[arg(long, default_value_t = 1.0)]
+        cpu_factor: f64,
+        /// Memory factor per request (sets workload type, fixed for the run)
+        #[arg(long, default_value_t = 1.0)]
+        mem_factor: f64,
+        /// Controller policy: unified | hpa-only | vpa-only
+        #[arg(long, default_value = "unified")]
+        policy: String,
     },
     /// Run HTTP load generator against the toy service
     Loadgen {
@@ -161,8 +192,8 @@ fn main() {
             scenario_workday(&output);
             scenario_flash_sale(&output);
         }
-        Some(Commands::Service { port, cpu_factor, mem_factor, max_concurrency, worker_threads }) => {
-            if let Err(e) = run_service(*port, *cpu_factor, *mem_factor, *max_concurrency, *worker_threads) {
+        Some(Commands::Service { port, bind_addr, cpu_factor, mem_factor, max_concurrency, worker_threads }) => {
+            if let Err(e) = run_service(*port, bind_addr, *cpu_factor, *mem_factor, *max_concurrency, *worker_threads) {
                 eprintln!("Service error: {:#}", e);
                 std::process::exit(1);
             }
@@ -182,6 +213,25 @@ fn main() {
                 *cpu_factor, *mem_factor, csv_dir,
             ) {
                 eprintln!("HttpControl error: {:#}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::DockerControl {
+            image,
+            proxy_port,
+            initial_replicas,
+            duration,
+            control_interval,
+            cpu_factor,
+            mem_factor,
+            policy,
+        }) => {
+            let csv_dir = if cli.csv { Some(output.csv_dir.as_str()) } else { None };
+            if let Err(e) = docker::controller::run_docker_controller(
+                *proxy_port, image, *initial_replicas, *duration, *control_interval,
+                *cpu_factor, *mem_factor, policy, csv_dir,
+            ) {
+                eprintln!("DockerControl error: {:#}", e);
                 std::process::exit(1);
             }
         }
